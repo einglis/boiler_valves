@@ -98,7 +98,7 @@ uint32_t status_pattern = 0x00000001;
 
 enum State { idle, demand, overrun };
 State state = State::idle;
-int overrun_counter_ms = 0;
+long int overrun_counter_ms = 0;
 
 // ------------------------------------
 
@@ -244,7 +244,7 @@ void loop()
   digitalWrite( outputs::boiler_pin, boiler_demand );
 
   if (boiler_demand)
-    overrun_counter_ms = 5 * 60 * 1000; // five minutes
+    overrun_counter_ms = 5 * 60 * 1000L; // five minutes
   else if (overrun_counter_ms > 0)
     overrun_counter_ms--;
 
