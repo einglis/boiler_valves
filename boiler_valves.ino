@@ -1,4 +1,8 @@
 
+#include <Adafruit_SleepyDog.h>
+
+// ----------------------------------------------------------------------------
+
 namespace outputs {
   enum {
     status_pin = LED_BUILTIN, // (aka 13 on Arduino Nano)
@@ -91,7 +95,6 @@ Channel *overrun_ch = &ch3; // the valve that gets opened on the overrun
 // ----------------------------------------------------------------------------
 
 uint32_t status_pattern = 0x00000001;
-uint32_t pattern_mask = 0x00000001; // not strictly a mask
 
 enum State { idle, demand, overrun };
 State state = State::idle;
@@ -103,6 +106,7 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println("");
+  Serial.println("Boiler valve manager");
 
   pinMode( outputs::status_pin, OUTPUT );
   pinMode( outputs::boiler_pin, OUTPUT );
@@ -110,7 +114,8 @@ void setup()
   for (auto chan : channels)
     chan->setup();
 
-  // XXXEDD: watchdog?
+  Watchdog.enable(5000);
+    // five second watchdog, petted every few seconds by the status LED loop
 }
 
 // ----------------------------------------------------------------------------
@@ -236,10 +241,10 @@ void loop()
     Serial.println((boiler_demand) ? "BOILER ON" : "boiler off");
   last_boiler_demand = boiler_demand;
 
-  digitalWrite( outputs::boiler_pin, boiler_demand);
+  digitalWrite( outputs::boiler_pin, boiler_demand );
 
   if (boiler_demand)
-    overrun_counter_ms = 10 * 1000; // 10 seconds for now
+    overrun_counter_ms = 5 * 60 * 1000; // five minutes
   else if (overrun_counter_ms > 0)
     overrun_counter_ms--;
 
@@ -247,9 +252,13 @@ void loop()
   static long pattern_time = now;
   if (now - pattern_time > 100)
   {
+    static uint32_t pattern_mask = 0x00000001; // not strictly a mask
     pattern_mask = (pattern_mask >> 1) | (pattern_mask << 31); // roll right 1
       // roll the mask, then AND with the pattern, to keep nice transitions
     digitalWrite( outputs::status_pin, !!(status_pattern & pattern_mask) );
     pattern_time = now;
+
+    if (pattern_mask == 1)
+      Watchdog.reset();
   }
 }
