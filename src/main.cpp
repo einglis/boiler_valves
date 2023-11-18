@@ -1,3 +1,4 @@
+#include <Arduino.h>
 
 #include <Adafruit_SleepyDog.h>
 
@@ -7,10 +8,15 @@ namespace outputs {
   enum {
     status_pin = LED_BUILTIN, // (aka 13 on Arduino Nano)
     valve_hw_pin  =  8,
+    valve_hw_led  = A3,
     valve_ch1_pin =  9,
+    valve_ch1_led = A2,
     valve_ch2_pin = 10,
+    valve_ch2_led = A1,
     valve_ch3_pin = 11,
+    valve_ch3_led = A0,
     boiler_pin    = 12,
+    boiler_led    = A4,
   };
 }
 namespace inputs {
@@ -22,23 +28,36 @@ namespace inputs {
   };
 }
 
+const int open_time_ms = 8000; // seems tremendously slow, but the valves are actally even slower to open fully
+const int close_time_ms = 4000;
+const long overrun_time_ms = 5 * 60 * 1000L; // five minutes
+
+static uint32_t pattern_mask = 0x00000001; // not strictly a mask
+static uint32_t min_brightness = 0x01010101;
+static uint32_t mid_brightness = 0x11111111;
+
+uint32_t roll_right( uint32_t x ) { return (x >> 1) | (x << 31); }
+
 // ----------------------------------------------------------------------------
 
 class Channel
 {
 public:
-  Channel( int input_pin, int output_pin )
+  Channel( int input_pin, int output_pin, int led_pin )
     : in_pin{ input_pin }
     , out_pin{ output_pin }
+    , led_pin{ led_pin }
     , demand_count{ 0 }
     , demand{ false }
     , open_count{ 0 }
+    , close_count{ 0 }
   {}
 
   void setup()
   {
-    pinMode( out_pin, OUTPUT );
     pinMode( in_pin, INPUT );
+    pinMode( out_pin, OUTPUT );
+    pinMode( led_pin, OUTPUT );
   }
 
   void poll()
@@ -55,7 +74,19 @@ public:
       demand = false;
 
     if (open_count > 0 && open_count < open_count_max)
+    {
+      digitalWrite( led_pin, !!((uint32_t)0x7f7f7f7f & pattern_mask & min_brightness) );
       open_count++;
+    }
+    else if (close_count > 0 && close_count < close_count_max)
+    {
+      digitalWrite( led_pin, !!((uint32_t)0x30303030 & pattern_mask & mid_brightness) );
+      close_count++;
+    }
+    else
+    {
+      digitalWrite( led_pin, open_count > 0 );
+    }
   }
 
   void open()
@@ -63,11 +94,14 @@ public:
     digitalWrite( out_pin, true );
     if (open_count == 0)
       open_count = 1;  // get the ball rolling
+    close_count = 0;
   }
   void close()
   {
     digitalWrite( out_pin, false );
     open_count = 0;
+    if (close_count == 0)
+      close_count = 1;
   }
 
   bool has_demand() { return demand; }
@@ -76,19 +110,23 @@ public:
 private:
   const int in_pin;
   const int out_pin;
+  const int led_pin;
 
-  int demand_count;
-  enum { demand_count_max = 512 };
+  long demand_count;
+  enum { demand_count_max = 512 }; // magic number; half a second demand -> on; 9 ms no demand -> off
   bool demand;
 
-  int open_count;
-  enum { open_count_max = 2000 };
+  long open_count;
+  enum { open_count_max = open_time_ms };
+  long close_count;
+  enum { close_count_max = close_time_ms };
+
 };
 
-Channel hw  = { inputs::control_hw_pin,  outputs::valve_hw_pin  };
-Channel ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin };
-Channel ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin };
-Channel ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin };
+Channel hw  = { inputs::control_hw_pin,  outputs::valve_hw_pin,  outputs::valve_hw_led  };
+Channel ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led };
+Channel ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led };
+Channel ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led };
 Channel *channels[] = { &hw, &ch1, &ch2, &ch3 };
 Channel *overrun_ch = &ch3; // the valve that gets opened on the overrun
 
@@ -99,6 +137,7 @@ uint32_t status_pattern = 0x00000001;
 enum State { idle, demand, overrun };
 State state = State::idle;
 long int overrun_counter_ms = 0;
+long int underrun_counter_ms = 0;
 
 // ------------------------------------
 
@@ -110,6 +149,7 @@ void setup()
 
   pinMode( outputs::status_pin, OUTPUT );
   pinMode( outputs::boiler_pin, OUTPUT );
+  pinMode( outputs::boiler_led, OUTPUT );
 
   for (auto chan : channels)
     chan->setup();
@@ -157,6 +197,10 @@ void loop()
     return;
   last = now;
 
+  min_brightness = roll_right(min_brightness);
+  mid_brightness = roll_right(mid_brightness);
+
+
 
   unsigned int this_demand = 0;
   unsigned int this_open = 0;
@@ -187,7 +231,7 @@ void loop()
       Serial.println("NEW STATE: demand");
 
     state = State::demand;
-    status_pattern = 0x00010001; // slow-ish blink
+    //status_pattern = 0x00010001; // slow-ish blink
 
     for (auto chan : channels)
     {
@@ -207,7 +251,7 @@ void loop()
       Serial.println("NEW STATE: overrun");
 
     state = State::overrun;
-    status_pattern = 0x11111111; // fast-ish blink
+    //status_pattern = 0x11111111; // fast-ish blink
 
     overrun_ch->open();
       // on the overrun, open this specific channel...
@@ -227,7 +271,7 @@ void loop()
       Serial.println("NEW STATE: idle");
 
     state = State::idle;
-    status_pattern = 0x00000001; // slow blink
+    //status_pattern = 0x00000001; // slow blink
 
     for (auto chan : channels)
       chan->close(); // belt and braces
@@ -238,23 +282,44 @@ void loop()
 
   static bool last_boiler_demand = false;
   if (boiler_demand != last_boiler_demand)
+  {
     Serial.println((boiler_demand) ? "BOILER ON" : "boiler off");
+    if (boiler_demand)
+      underrun_counter_ms = 6000;
+  }
   last_boiler_demand = boiler_demand;
 
-  digitalWrite( outputs::boiler_pin, boiler_demand );
 
   if (boiler_demand)
-    overrun_counter_ms = 5 * 60 * 1000L; // five minutes
+  {
+    if (underrun_counter_ms)
+    {
+      digitalWrite( outputs::boiler_led, !!((uint32_t)0xf0f0f0f0 & pattern_mask & min_brightness) );
+      underrun_counter_ms--;
+    }
+    else
+    {
+      digitalWrite( outputs::boiler_pin, HIGH );
+      digitalWrite( outputs::boiler_led, HIGH );
+      overrun_counter_ms = overrun_time_ms;
+    }
+  }
   else if (overrun_counter_ms > 0)
+  {
+    digitalWrite( outputs::boiler_pin, LOW );
+    digitalWrite( outputs::boiler_led, !!((uint32_t)0xf0000000 & pattern_mask & min_brightness) );
     overrun_counter_ms--;
-
+  }
+  else
+  {
+    digitalWrite( outputs::boiler_pin, LOW );
+    digitalWrite( outputs::boiler_led, LOW );
+  }
 
   static long pattern_time = now;
   if (now - pattern_time > 100)
   {
-    static uint32_t pattern_mask = 0x00000001; // not strictly a mask
-    pattern_mask = (pattern_mask >> 1) | (pattern_mask << 31); // roll right 1
-      // roll the mask, then AND with the pattern, to keep nice transitions
+    pattern_mask = roll_right(pattern_mask);
     digitalWrite( outputs::status_pin, !!(status_pattern & pattern_mask) );
     pattern_time = now;
 
