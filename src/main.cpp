@@ -106,7 +106,7 @@ public:
 
   void open()
   {
-    digitalWrite( out_pin, true );
+    digitalWrite( out_pin, HIGH );
     if (open_count == 0)
       open_count = 1;  // get the ball rolling
     close_count = 0;
@@ -114,7 +114,7 @@ public:
 
   void close()
   {
-    digitalWrite( out_pin, false );
+    digitalWrite( out_pin, LOW );
     if (close_count == 0)
       close_count = 1;
     open_count = 0;
