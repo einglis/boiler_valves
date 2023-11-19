@@ -33,7 +33,7 @@ const int  open_time_ms = 8000; // seems tremendously slow, but the valves are a
 const int close_time_ms = 4000;
 const long overrun_time_ms = 5 * 60 * 1000L;
   // five minutes, the length of time we hold the overrun valve open once all demand is gone
-const long underrun_time_ms = close_time_ms;
+const long underrun_time_ms = close_time_ms + 1000;
   // the time we wait before allowing the demand signal to propagate to the boiler
 
 // ----------------------------------------------------------------------------
@@ -57,15 +57,16 @@ void pattern( int pin, unsigned int pattern )
 class Channel
 {
 public:
-  Channel( int input_pin, int output_pin, int led_pin )
-    : in_pin{ input_pin }
+  Channel( int input_pin, int output_pin, int led_pin, const char* tag )
+    : tag{ tag }
+    , in_pin{ input_pin }
     , out_pin{ output_pin }
     , led_pin{ led_pin }
     , demand_count{ 0 }
     , demand{ false }
     , open_count{ 0 }
     , close_count{ 0 }
-  {}
+  { }
 
   void setup()
   {
@@ -110,6 +111,7 @@ public:
       open_count = 1;  // get the ball rolling
     close_count = 0;
   }
+
   void close()
   {
     digitalWrite( out_pin, false );
@@ -120,6 +122,8 @@ public:
 
   bool has_demand() { return demand; }
   bool fully_open() { return open_count == open_count_max; }
+
+  const char *const tag;
 
 private:
   const int in_pin;
@@ -136,10 +140,10 @@ private:
   enum { close_count_max = close_time_ms };
 };
 
-Channel hw  = { inputs::control_hw_pin,  outputs::valve_hw_pin,  outputs::valve_hw_led  };
-Channel ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led };
-Channel ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led };
-Channel ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led };
+Channel hw  = { inputs::control_hw_pin,  outputs::valve_hw_pin,  outputs::valve_hw_led,  "HW"  };
+Channel ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led, "CH1" };
+Channel ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led, "CH2" };
+Channel ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led, "CH3" };
 Channel *channels[] = { &hw, &ch1, &ch2, &ch3 };
 Channel *overrun_ch = &ch3; // the valve that gets opened on the overrun
 
@@ -256,6 +260,23 @@ void loop()
   static unsigned int last_open = 0;
   if (this_demand != last_demand || this_open != last_open)
     report_state_change( this_demand, last_demand, this_open, last_open );
+
+  if (this_demand == 0 && last_demand != 0)
+  {
+    overrun_ch = &ch3; // safety net
+
+    int index = 0;
+    for (auto chan : channels)
+    {
+      if (last_open & (1 << index))
+        overrun_ch = chan;
+      index++;
+    }
+
+    Serial.print("Overrun is ");
+    Serial.println(overrun_ch->tag);
+  }
+
   last_demand = this_demand;
   last_open = this_open;
 
@@ -334,7 +355,7 @@ void loop()
   else if (overrun_counter_ms > 0) // off but cooling (overrun)
   {
     digitalWrite( outputs::boiler_pin, LOW );
-    pattern( outputs::boiler_led, 0x03c0 & min_brightness ); // 0x03c0 rather than 0xff00 just to desynchronise a little
+    pattern( outputs::boiler_led, 0x02c0 & min_brightness ); // 0x02c0 rather than 0xb000 just to desynchronise a little
     overrun_counter_ms--;
   }
   else // off
