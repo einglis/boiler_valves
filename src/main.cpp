@@ -1,21 +1,22 @@
 #include <Arduino.h>
-
 #include <Adafruit_SleepyDog.h>
 
 // ----------------------------------------------------------------------------
 
 namespace outputs {
   enum {
-    status_pin = LED_BUILTIN, // (aka 13 on Arduino Nano)
+    status_led = LED_BUILTIN, // (aka 13 on Arduino Nano)
+
     valve_hw_pin  =  8,
-    valve_hw_led  = A3,
     valve_ch1_pin =  9,
-    valve_ch1_led = A2,
     valve_ch2_pin = 10,
-    valve_ch2_led = A1,
     valve_ch3_pin = 11,
-    valve_ch3_led = A0,
     boiler_pin    = 12,
+
+    valve_hw_led  = A3,
+    valve_ch1_led = A2,
+    valve_ch2_led = A1,
+    valve_ch3_led = A0,
     boiler_led    = A4,
   };
 }
@@ -28,15 +29,28 @@ namespace inputs {
   };
 }
 
-const int open_time_ms = 8000; // seems tremendously slow, but the valves are actally even slower to open fully
+const int  open_time_ms = 8000; // seems tremendously slow, but the valves are actally even slower to open fully
 const int close_time_ms = 4000;
-const long overrun_time_ms = 5 * 60 * 1000L; // five minutes
+const long overrun_time_ms = 5 * 60 * 1000L;
+  // five minutes, the length of time we hold the overrun valve open once all demand is gone
+const long underrun_time_ms = close_time_ms;
+  // the time we wait before allowing the demand signal to propagate to the boiler
 
-static uint32_t pattern_mask = 0x00000001; // not strictly a mask
-static uint32_t min_brightness = 0x01010101;
-static uint32_t mid_brightness = 0x11111111;
+// ----------------------------------------------------------------------------
 
-uint32_t roll_right( uint32_t x ) { return (x >> 1) | (x << 31); }
+unsigned int pattern_phase = 0x0001;
+  // rolled every 100ms for status
+
+unsigned int min_brightness = 0x0101; // less frequent than 1 in 8 gives a noticable flicker
+unsigned int mid_brightness = 0x1111;
+  // rolled every millisecond for PWM
+
+unsigned int roll_right( unsigned int x ) { return (x >> 1) | (x << 15); }
+
+void pattern( int pin, unsigned int pattern )
+{
+  digitalWrite( pin, !!(pattern & pattern_phase) ); // !! as patterns are 16-bit but digitalWrite takes an 8-bit.
+}
 
 // ----------------------------------------------------------------------------
 
@@ -73,17 +87,17 @@ public:
     else if (demand_count == 0)
       demand = false;
 
-    if (open_count > 0 && open_count < open_count_max)
+    if (open_count > 0 && open_count < open_count_max) // opening
     {
-      digitalWrite( led_pin, !!((uint32_t)0x7f7f7f7f & pattern_mask & min_brightness) );
+      pattern( led_pin, 0xff00 & mid_brightness );
       open_count++;
     }
-    else if (close_count > 0 && close_count < close_count_max)
+    else if (close_count > 0 && close_count < close_count_max) // closing
     {
-      digitalWrite( led_pin, !!((uint32_t)0x30303030 & pattern_mask & mid_brightness) );
+      pattern( led_pin, 0x3333 & mid_brightness );
       close_count++;
     }
-    else
+    else // open or closed
     {
       digitalWrite( led_pin, open_count > 0 );
     }
@@ -99,13 +113,13 @@ public:
   void close()
   {
     digitalWrite( out_pin, false );
-    open_count = 0;
     if (close_count == 0)
       close_count = 1;
+    open_count = 0;
   }
 
   bool has_demand() { return demand; }
-  bool is_open() { return open_count == open_count_max; }
+  bool fully_open() { return open_count == open_count_max; }
 
 private:
   const int in_pin;
@@ -116,11 +130,10 @@ private:
   enum { demand_count_max = 512 }; // magic number; half a second demand -> on; 9 ms no demand -> off
   bool demand;
 
-  long open_count;
+  long open_count;  // counts up
   enum { open_count_max = open_time_ms };
-  long close_count;
+  long close_count;  // counts up
   enum { close_count_max = close_time_ms };
-
 };
 
 Channel hw  = { inputs::control_hw_pin,  outputs::valve_hw_pin,  outputs::valve_hw_led  };
@@ -132,22 +145,13 @@ Channel *overrun_ch = &ch3; // the valve that gets opened on the overrun
 
 // ----------------------------------------------------------------------------
 
-uint32_t status_pattern = 0x00000001;
-
-enum State { idle, demand, overrun };
-State state = State::idle;
-long int overrun_counter_ms = 0;
-long int underrun_counter_ms = 0;
-
-// ------------------------------------
-
 void setup()
 {
   Serial.begin(115200);
   Serial.println("");
   Serial.println("Boiler valve manager");
 
-  pinMode( outputs::status_pin, OUTPUT );
+  pinMode( outputs::status_led, OUTPUT );
   pinMode( outputs::boiler_pin, OUTPUT );
   pinMode( outputs::boiler_led, OUTPUT );
 
@@ -159,6 +163,23 @@ void setup()
 }
 
 // ----------------------------------------------------------------------------
+
+enum State { idle, demand, overrun };
+State curr_state = State::idle;
+
+void my_state( State state )
+{
+  if (state != curr_state)
+  {
+    switch (state)
+    {
+      case idle:    Serial.println(F("NEW STATE: idle"));    break;
+      case demand:  Serial.println(F("NEW STATE: demand"));  break;
+      case overrun: Serial.println(F("NEW STATE: overrun")); break;
+    }
+    curr_state = state;
+  }
+}
 
 static size_t bits_to_tags( char *buf, unsigned int x )
 {
@@ -187,6 +208,11 @@ static void report_state_change(
   Serial.println(buf);
 }
 
+// ----------------------------------------------------------------------------
+
+long overrun_counter_ms = 0;   // counts down
+long underrun_counter_ms = 0;  // counts down
+
 // ------------------------------------
 
 void loop()
@@ -195,22 +221,34 @@ void loop()
   unsigned long now = millis();
   if (now == last)
     return;
+
+  min_brightness = roll_right(min_brightness); // update PWMs
+  mid_brightness = roll_right(mid_brightness);
   last = now;
 
-  min_brightness = roll_right(min_brightness);
-  mid_brightness = roll_right(mid_brightness);
 
+  static unsigned long pattern_last = now;
+  if (now - pattern_last > 100)
+  {
+    pattern_phase = roll_right(pattern_phase);
+    pattern_last = now;
+
+    if (pattern_phase == 1)
+      Watchdog.reset();
+  }
+
+  pattern( outputs::status_led, 0x0001 & min_brightness );
 
 
   unsigned int this_demand = 0;
   unsigned int this_open = 0;
-  int index = 0;
 
+  int index = 0;
   for (auto chan : channels)
   {
     chan->poll();
     if (chan->has_demand()) this_demand |= (1 << index);
-    if (chan->is_open())    this_open   |= (1 << index);
+    if (chan->fully_open()) this_open   |= (1 << index);
     index++;
   }
 
@@ -227,17 +265,13 @@ void loop()
 
   if (this_demand != 0)
   {
-    if (state != State::demand)
-      Serial.println("NEW STATE: demand");
-
-    state = State::demand;
-    //status_pattern = 0x00010001; // slow-ish blink
+    my_state( State::demand ); // record-keeping
 
     for (auto chan : channels)
     {
       if (chan->has_demand())
         chan->open();
-      else if (!chan->is_open())
+      else if (!chan->fully_open())
         chan->close();  // never got fully open; just close.
       else if (any_demanded_is_open)
         chan->close();  // at least one demanded valve is fully open (implictly not this one)
@@ -247,15 +281,11 @@ void loop()
   }
   else if (overrun_counter_ms > 0)
   {
-    if (state != State::overrun)
-      Serial.println("NEW STATE: overrun");
-
-    state = State::overrun;
-    //status_pattern = 0x11111111; // fast-ish blink
+    my_state( State::overrun );
 
     overrun_ch->open();
       // on the overrun, open this specific channel...
-    if (overrun_ch->is_open())
+    if (overrun_ch->fully_open())
     {
       // ...then once it's open, close all the others.
       for (auto chan : channels)
@@ -267,11 +297,7 @@ void loop()
   }
   else
   {
-    if (state != State::idle)
-      Serial.println("NEW STATE: idle");
-
-    state = State::idle;
-    //status_pattern = 0x00000001; // slow blink
+    my_state( State::idle );
 
     for (auto chan : channels)
       chan->close(); // belt and braces
@@ -285,45 +311,35 @@ void loop()
   {
     Serial.println((boiler_demand) ? "BOILER ON" : "boiler off");
     if (boiler_demand)
-      underrun_counter_ms = 6000;
+      underrun_counter_ms = underrun_time_ms; // delay demand propagation
   }
   last_boiler_demand = boiler_demand;
 
 
   if (boiler_demand)
   {
-    if (underrun_counter_ms)
+    if (underrun_counter_ms) // waiting to turn on
     {
-      digitalWrite( outputs::boiler_led, !!((uint32_t)0xf0f0f0f0 & pattern_mask & min_brightness) );
+      digitalWrite( outputs::boiler_pin, LOW );
+      pattern( outputs::boiler_led, 0xf0f0 & mid_brightness );
       underrun_counter_ms--;
     }
-    else
+    else // on
     {
       digitalWrite( outputs::boiler_pin, HIGH );
       digitalWrite( outputs::boiler_led, HIGH );
       overrun_counter_ms = overrun_time_ms;
     }
   }
-  else if (overrun_counter_ms > 0)
+  else if (overrun_counter_ms > 0) // off but cooling (overrun)
   {
     digitalWrite( outputs::boiler_pin, LOW );
-    digitalWrite( outputs::boiler_led, !!((uint32_t)0xf0000000 & pattern_mask & min_brightness) );
+    pattern( outputs::boiler_led, 0x03c0 & min_brightness ); // 0x03c0 rather than 0xff00 just to desynchronise a little
     overrun_counter_ms--;
   }
-  else
+  else // off
   {
     digitalWrite( outputs::boiler_pin, LOW );
     digitalWrite( outputs::boiler_led, LOW );
-  }
-
-  static long pattern_time = now;
-  if (now - pattern_time > 100)
-  {
-    pattern_mask = roll_right(pattern_mask);
-    digitalWrite( outputs::status_pin, !!(status_pattern & pattern_mask) );
-    pattern_time = now;
-
-    if (pattern_mask == 1)
-      Watchdog.reset();
   }
 }
