@@ -145,7 +145,11 @@ Channel ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_
 Channel ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led, "CH2" };
 Channel ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led, "CH3" };
 Channel *channels[] = { &hw, &ch1, &ch2, &ch3 };
-Channel *overrun_ch = &ch3; // the valve that gets opened on the overrun
+Channel *overrun_ch = &ch1; // the valve that gets opened on the overrun
+
+// ideally, ch3 would be the default choice, since that'll be the towel rads
+// but it's likely this'll be in use before that's plumbed, so needs to work
+// safely with only one heating valve: ch1.
 
 // ----------------------------------------------------------------------------
 
@@ -263,7 +267,7 @@ void loop()
 
   if (this_demand == 0 && last_demand != 0)
   {
-    overrun_ch = &ch3; // safety net
+    overrun_ch = &ch1; // safety net - see comment near definition for choice of ch1.
 
     int index = 0;
     for (auto chan : channels)
@@ -273,7 +277,7 @@ void loop()
       index++;
     }
 
-    Serial.print("Overrun is ");
+    Serial.print("Overrun valve is ");
     Serial.println(overrun_ch->tag);
   }
 
@@ -303,6 +307,7 @@ void loop()
   else if (overrun_counter_ms > 0)
   {
     my_state( State::overrun );
+    boiler_demand = false;
 
     overrun_ch->open();
       // on the overrun, open this specific channel...
@@ -314,16 +319,14 @@ void loop()
           chan->close();
     }
 
-    boiler_demand = false;
   }
   else
   {
     my_state( State::idle );
+    boiler_demand = false;
 
     for (auto chan : channels)
       chan->close(); // belt and braces
-
-    boiler_demand = false;
   }
 
 
