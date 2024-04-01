@@ -13,10 +13,10 @@ namespace outputs {
     valve_ch3_pin = 11,
     boiler_pin    = 12,
 
-    valve_hw_led  = A3,
-    valve_ch1_led = A2,
-    valve_ch2_led = A1,
-    valve_ch3_led = A0,
+    valve_hw_led  = A0,
+    valve_ch1_led = A1,
+    valve_ch2_led = A2,
+    valve_ch3_led = A3,
     boiler_led    = A4,
   };
 }
@@ -57,27 +57,23 @@ void pattern( int pin, unsigned int pattern )
 class Channel
 {
 public:
-  Channel( int input_pin, int output_pin, int led_pin, const char* tag )
-    : tag{ tag }
-    , in_pin{ input_pin }
-    , out_pin{ output_pin }
-    , led_pin{ led_pin }
-    , demand_count{ 0 }
+  Channel( int (*demand_in_fn)(void*), void (*valve_out_fn)(void*, int), void* fn_context )
+    : input_fn{ demand_in_fn }
+    , output_fn{ valve_out_fn }
+    , fn_context{ fn_context }
     , demand{ false }
-    , open_count{ 0 }
-    , close_count{ 0 }
+    , demand_count{ 0 }
+    , curr_state{ Closed }
+    , open_close_count{ 0 }
   { }
 
-  void setup()
-  {
-    pinMode( in_pin, INPUT );
-    pinMode( out_pin, OUTPUT );
-    pinMode( led_pin, OUTPUT );
-  }
+  enum valve_state { Closed, Opening, Open, Closing };
+  valve_state state() const { return curr_state; }
 
-  void poll()
+  void ms_poll()
   {
-    const int in = digitalRead( in_pin );
+    const int in = input_fn( fn_context );
+
     if (in && demand_count < demand_count_max)
       demand_count++;     // unequal debounce with 512 steps up...
     else if (!in && demand_count > 0)
@@ -88,68 +84,172 @@ public:
     else if (demand_count == 0)
       demand = false;
 
-    if (open_count > 0 && open_count < open_count_max) // opening
-    {
-      pattern( led_pin, 0xff00 & mid_brightness );
-      open_count++;
-    }
-    else if (close_count > 0 && close_count < close_count_max) // closing
-    {
-      pattern( led_pin, 0x3333 & mid_brightness );
-      close_count++;
-    }
-    else // open or closed
-    {
-      digitalWrite( led_pin, open_count > 0 );
-    }
+
+    if (curr_state == Opening && open_close_count == 0)
+      curr_state = Open;
+    else if (curr_state == Closing && open_close_count  == 0)
+      curr_state = Closed;
+
+    if (open_close_count > 0)
+      --open_close_count;
   }
 
   void open()
   {
-    digitalWrite( out_pin, HIGH );
-    if (open_count == 0)
-      open_count = 1;  // get the ball rolling
-    close_count = 0;
+    output_fn( fn_context, HIGH );
+
+    if (curr_state != Open && curr_state != Opening)
+    {
+      curr_state = Opening;
+      open_close_count = open_time_ms;
+    }
   }
 
   void close()
   {
-    digitalWrite( out_pin, LOW );
-    if (close_count == 0)
-      close_count = 1;
-    open_count = 0;
+    output_fn( fn_context, LOW );
+
+    if (curr_state != Closed && curr_state != Closing)
+    {
+      curr_state = Closing;
+      open_close_count = close_time_ms;
+    }
   }
 
-  bool has_demand() { return demand; }
-  bool fully_open() { return open_count == open_count_max; }
-
-  const char *const tag;
+  bool has_demand() const { return demand; }
+  bool fully_open() const { return curr_state == Open; }
 
 private:
+  int (*input_fn)(void*);
+  void (*output_fn)(void*, int);
+  void* fn_context;
+    // can't use std::function on AVR Arduino targets.
+
+  bool demand;
+  long demand_count;
+  enum { demand_count_max = 512 }; // magic number; half a second demand -> on; 9 ms no demand -> off
+
+  valve_state curr_state;
+  long open_close_count;
+};
+
+class Boiler
+{
+public:
+  Boiler( void (*demand_out_fn)(void*, int), void* fn_context )
+    : output_fn{ demand_out_fn }
+    , fn_context{ fn_context }
+    , curr_demand{ false }
+    , curr_state{ Idle }
+    , underrun_counter{ 0 }
+    , overrun_counter{0 }
+    { }
+
+  enum demand_state { Idle, Underrun, Demand, Overrun };
+  demand_state state() const { return curr_state; }
+  bool idle() const { return curr_state == Idle; }
+
+  void demand( bool demand )
+  {
+    if (demand != curr_demand)
+    {
+      Serial.println( (demand) ? "BOILER ON" : "boiler off" );
+      if (demand)
+        underrun_counter = underrun_time_ms; // delay demand propagation
+    }
+    curr_demand = demand;
+  }
+
+  void ms_poll()
+  {
+    if (curr_demand)
+    {
+      if (underrun_counter) // waiting to turn on
+      {
+        --underrun_counter;
+        curr_state = Underrun;
+      }
+      else // on
+      {
+        overrun_counter = overrun_time_ms;
+        curr_state = Demand;
+      }
+    }
+    else if (overrun_counter > 0) // off but cooling (overrun)
+    {
+      --overrun_counter;
+      curr_state = Overrun;
+    }
+    else // off
+    {
+      curr_state = Idle;
+    }
+
+    output_fn( fn_context, curr_state == Demand );
+  }
+
+private:
+  void (*output_fn)(void*, int);
+  void* fn_context;
+    // can't use std::function on AVR Arduino targets.
+
+  bool curr_demand;
+  demand_state curr_state;
+
+  long underrun_counter;
+  long overrun_counter;
+
+};
+
+
+
+
+class ChannelEx : public Channel
+{
+public:
+  ChannelEx( int in_pin, int out_pin, int led_pin, const char* tag )
+    : Channel( input_fn, output_fn, this )
+    , in_pin{ in_pin }
+    , out_pin{ out_pin }
+    , led_pin{ led_pin }
+    , tag{ tag }
+  { }
   const int in_pin;
   const int out_pin;
   const int led_pin;
-
-  long demand_count;
-  enum { demand_count_max = 512 }; // magic number; half a second demand -> on; 9 ms no demand -> off
-  bool demand;
-
-  long open_count;  // counts up
-  enum { open_count_max = open_time_ms };
-  long close_count;  // counts up
-  enum { close_count_max = close_time_ms };
+  const char* tag;
+private:
+  static int input_fn( void* context ) { return digitalRead( ((ChannelEx*)context)->in_pin ); }
+  static void output_fn( void* context, int v ) { digitalWrite( ((ChannelEx*)context)->out_pin, v ); }
 };
 
-Channel hw  = { inputs::control_hw_pin,  outputs::valve_hw_pin,  outputs::valve_hw_led,  "HW"  };
-Channel ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led, "CH1" };
-Channel ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led, "CH2" };
-Channel ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led, "CH3" };
-Channel *channels[] = { &hw, &ch1, &ch2, &ch3 };
-Channel *overrun_ch = &ch1; // the valve that gets opened on the overrun
+class BoilerEx : public Boiler
+{
+public:
+  BoilerEx( int out_pin, int led_pin )
+    : Boiler( output_fn, this )
+    , out_pin{ out_pin }
+    , led_pin{ led_pin }
+  { }
+  const int out_pin;
+  const int led_pin;
+private:
+  static void output_fn( void* context, int d ) { digitalWrite( ((BoilerEx*)context)->out_pin, d ); }
+};
+
+
+ChannelEx hw  = { inputs::control_hw_pin, outputs::valve_hw_pin, outputs::valve_hw_led,  "HW"  };
+ChannelEx ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led, "CH1" };
+ChannelEx ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led, "CH2" };
+ChannelEx ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led, "CH3" };
+ChannelEx *channels[] = { &hw, &ch1, &ch2, &ch3 };
+ChannelEx *overrun_ch = &ch1; // the valve that gets opened on the overrun
 
 // ideally, ch3 would be the default choice, since that'll be the towel rads
 // but it's likely this'll be in use before that's plumbed, so needs to work
 // safely with only one heating valve: ch1.
+
+BoilerEx boiler = { outputs::boiler_pin, outputs::boiler_led };
 
 // ----------------------------------------------------------------------------
 
@@ -160,11 +260,25 @@ void setup()
   Serial.println("Boiler valve manager");
 
   pinMode( outputs::status_led, OUTPUT );
+
+  pinMode( inputs::control_hw_pin, INPUT );
+  pinMode( outputs::valve_hw_pin, OUTPUT );
+  pinMode( outputs::valve_hw_led, OUTPUT );
+
+  pinMode( inputs::control_ch1_pin, INPUT );
+  pinMode(outputs::valve_ch1_pin, OUTPUT );
+  pinMode(outputs::valve_ch1_led, OUTPUT );
+
+  pinMode( inputs::control_ch2_pin, INPUT );
+  pinMode(outputs::valve_ch2_pin, OUTPUT );
+  pinMode(outputs::valve_ch2_led, OUTPUT );
+
+  pinMode( inputs::control_ch3_pin, INPUT );
+  pinMode(outputs::valve_ch3_pin, OUTPUT );
+  pinMode(outputs::valve_ch3_led, OUTPUT );
+
   pinMode( outputs::boiler_pin, OUTPUT );
   pinMode( outputs::boiler_led, OUTPUT );
-
-  for (auto chan : channels)
-    chan->setup();
 
   Watchdog.enable(5000);
     // five second watchdog, petted every few seconds by the status LED loop
@@ -254,7 +368,7 @@ void loop()
   int index = 0;
   for (auto chan : channels)
   {
-    chan->poll();
+    chan->ms_poll();
     if (chan->has_demand()) this_demand |= (1 << index);
     if (chan->fully_open()) this_open   |= (1 << index);
     index++;
@@ -286,7 +400,6 @@ void loop()
 
 
   unsigned int any_demanded_is_open = this_demand & this_open;
-  bool boiler_demand = false;
 
   if (this_demand != 0)
   {
@@ -302,12 +415,12 @@ void loop()
         chan->close();  // at least one demanded valve is fully open (implictly not this one)
     }
 
-    boiler_demand = any_demanded_is_open;
+    boiler.demand( any_demanded_is_open );
   }
-  else if (overrun_counter_ms > 0)
+  else if (!boiler.idle()) // ie overrun
   {
     my_state( State::overrun );
-    boiler_demand = false;
+    boiler.demand( false );
 
     overrun_ch->open();
       // on the overrun, open this specific channel...
@@ -318,52 +431,58 @@ void loop()
         if (chan != overrun_ch)
           chan->close();
     }
-
   }
   else
   {
     my_state( State::idle );
-    boiler_demand = false;
+    boiler.demand( false );
 
     for (auto chan : channels)
       chan->close(); // belt and braces
   }
 
 
-  static bool last_boiler_demand = false;
-  if (boiler_demand != last_boiler_demand)
-  {
-    Serial.println((boiler_demand) ? "BOILER ON" : "boiler off");
-    if (boiler_demand)
-      underrun_counter_ms = underrun_time_ms; // delay demand propagation
-  }
-  last_boiler_demand = boiler_demand;
+  boiler.ms_poll();
 
 
-  if (boiler_demand)
+
+
+  for (auto chan : channels)
   {
-    if (underrun_counter_ms) // waiting to turn on
+    switch (chan->state())
     {
-      digitalWrite( outputs::boiler_pin, LOW );
-      pattern( outputs::boiler_led, 0xf0f0 & mid_brightness );
-      underrun_counter_ms--;
-    }
-    else // on
-    {
-      digitalWrite( outputs::boiler_pin, HIGH );
-      digitalWrite( outputs::boiler_led, HIGH );
-      overrun_counter_ms = overrun_time_ms;
+      case Channel::Closed:
+        digitalWrite( chan->led_pin, LOW );
+        break;
+      case Channel::Opening:
+        pattern( chan->led_pin, 0xff00 & mid_brightness );
+        break;
+      case Channel::Open:
+        digitalWrite( chan->led_pin, HIGH );
+        break;
+      case Channel::Closing:
+        pattern( chan->led_pin, 0x3333 & mid_brightness );
+        break;
+      default:
+        break;
     }
   }
-  else if (overrun_counter_ms > 0) // off but cooling (overrun)
+
+  switch (boiler.state())
   {
-    digitalWrite( outputs::boiler_pin, LOW );
-    pattern( outputs::boiler_led, 0x02c0 & min_brightness ); // 0x02c0 rather than 0xb000 just to desynchronise a little
-    overrun_counter_ms--;
-  }
-  else // off
-  {
-    digitalWrite( outputs::boiler_pin, LOW );
-    digitalWrite( outputs::boiler_led, LOW );
+    case Boiler::Idle:
+      digitalWrite( boiler.led_pin, LOW );
+      break;
+    case Boiler::Underrun:
+      pattern( boiler.led_pin, 0xf0f0 & mid_brightness );
+      break;
+    case Boiler::Demand:
+      digitalWrite( boiler.led_pin, HIGH );
+      break;
+    case Boiler::Overrun:
+      pattern( boiler.led_pin, 0x02c0 & min_brightness ); // 0x02c0 rather than 0xb000 just to desynchronise a little
+      break;
+    default:
+      break;
   }
 }
