@@ -29,6 +29,7 @@ namespace inputs {
   };
 }
 
+
 const int  open_time_ms = 8000; // seems tremendously slow, but the valves are actally even slower to open fully
 const int close_time_ms = 4000;
 const long overrun_time_ms = 5 * 60 * 1000L;
@@ -147,16 +148,12 @@ public:
 
   enum demand_state { Idle, Underrun, Demand, Overrun };
   demand_state state() const { return curr_state; }
-  bool idle() const { return curr_state == Idle; }
+  bool is_idle() const { return curr_state == Idle; }
 
   void demand( bool demand )
   {
-    if (demand != curr_demand)
-    {
-      Serial.println( (demand) ? "BOILER ON" : "boiler off" );
-      if (demand)
-        underrun_counter = underrun_time_ms; // delay demand propagation
-    }
+    if (demand && !curr_demand)
+      underrun_counter = underrun_time_ms; // delay demand propagation
     curr_demand = demand;
   }
 
@@ -198,9 +195,103 @@ private:
 
   long underrun_counter;
   long overrun_counter;
-
 };
 
+class Controller
+{
+public:
+  Controller( Channel** channels, int num_channels, Channel* overrun_channel, Boiler* boiler )
+    : channels{ channels }
+    , num_channels{ num_channels }
+    , default_overrun{ overrun_channel }
+    , curr_overrun{ overrun_channel }
+    , boiler{ boiler }
+    , curr_state{ Idle }
+    , curr_demand{ 0 }
+    , curr_open{ 0 }
+  { }
+
+  enum control_state { Idle, Demand, Cool };
+  control_state state() const { return curr_state; }
+  unsigned int demand() const { return curr_demand; }
+  unsigned int open() const { return curr_open; }
+
+  void ms_poll()
+  {
+    unsigned int this_demand = 0;
+    unsigned int this_open = 0;
+
+    for (auto i = 0; i < num_channels; i++)
+    {
+      if (channels[i]->has_demand()) this_demand |= (1 << i);
+      if (channels[i]->fully_open()) this_open |= (1 << i);
+    }
+
+    if (this_demand == 0 && curr_demand != 0)
+    {
+      curr_overrun = default_overrun;
+
+      for (auto i = 0; i < num_channels; i++)
+        if (curr_open & (1 << i))
+          curr_overrun = channels[i]; // favour later channels
+    }
+
+    curr_demand = this_demand;
+    curr_open = this_open;
+
+
+    unsigned int any_demanded_is_open = this_demand & this_open;
+
+    if (this_demand != 0)
+    {
+      curr_state = Demand;
+      boiler->demand( any_demanded_is_open );
+
+      for (auto i = 0; i < num_channels; i++)
+      {
+        if (channels[i]->has_demand())
+          channels[i]->open();
+        else if (!channels[i]->fully_open())
+          channels[i]->close();  // never got fully open; just close.
+        else if (any_demanded_is_open)
+          channels[i]->close();  // at least one demanded valve is fully open (implictly not this one)
+      }
+    }
+    else if (!boiler->is_idle()) // ie overrun
+    {
+      curr_state = Cool;
+      boiler->demand( false );
+
+      curr_overrun->open();
+        // on the overrun, open this specific channel...
+      if (curr_overrun->fully_open())
+      {
+        // ...then once it's open, close all the others.
+        for (auto i = 0; i < num_channels; i++)
+          if (channels[i] != curr_overrun)
+            channels[i]->close();
+      }
+    }
+    else
+    {
+      curr_state = Idle;
+      boiler->demand( false );
+
+      for (auto i = 0; i < num_channels; i++)
+        channels[i]->close(); // belt and braces
+    }
+  }
+
+private:
+  Channel** channels;
+  const int num_channels;
+  Channel* default_overrun;
+  Channel* curr_overrun;
+  Boiler* boiler;
+  control_state curr_state;
+  unsigned int curr_demand;
+  unsigned int curr_open;
+};
 
 
 
@@ -238,18 +329,22 @@ private:
 };
 
 
-ChannelEx hw  = { inputs::control_hw_pin, outputs::valve_hw_pin, outputs::valve_hw_led,  "HW"  };
-ChannelEx ch1 = { inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led, "CH1" };
-ChannelEx ch2 = { inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led, "CH2" };
-ChannelEx ch3 = { inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led, "CH3" };
-ChannelEx *channels[] = { &hw, &ch1, &ch2, &ch3 };
-ChannelEx *overrun_ch = &ch1; // the valve that gets opened on the overrun
+ChannelEx hw( inputs::control_hw_pin, outputs::valve_hw_pin, outputs::valve_hw_led,  "HW"  );
+ChannelEx ch1( inputs::control_ch1_pin, outputs::valve_ch1_pin, outputs::valve_ch1_led, "CH1" );
+ChannelEx ch2( inputs::control_ch2_pin, outputs::valve_ch2_pin, outputs::valve_ch2_led, "CH2" );
+ChannelEx ch3( inputs::control_ch3_pin, outputs::valve_ch3_pin, outputs::valve_ch3_led, "CH3" );
+Channel *channels[] = { &hw, &ch1, &ch2, &ch3 };
+const size_t num_channels = sizeof(channels)/sizeof(channels[0]);
+
+Channel *overrun_ch = &ch1; // the valve that gets opened on the overrun
 
 // ideally, ch3 would be the default choice, since that'll be the towel rads
 // but it's likely this'll be in use before that's plumbed, so needs to work
 // safely with only one heating valve: ch1.
 
-BoilerEx boiler = { outputs::boiler_pin, outputs::boiler_led };
+BoilerEx boiler( outputs::boiler_pin, outputs::boiler_led );
+
+Controller control( channels, num_channels, &ch1 /*default overrun*/, &boiler );
 
 // ----------------------------------------------------------------------------
 
@@ -286,52 +381,6 @@ void setup()
 
 // ----------------------------------------------------------------------------
 
-enum State { idle, demand, overrun };
-State curr_state = State::idle;
-
-void my_state( State state )
-{
-  if (state != curr_state)
-  {
-    switch (state)
-    {
-      case idle:    Serial.println(F("NEW STATE: idle"));    break;
-      case demand:  Serial.println(F("NEW STATE: demand"));  break;
-      case overrun: Serial.println(F("NEW STATE: overrun")); break;
-    }
-    curr_state = state;
-  }
-}
-
-static size_t bits_to_tags( char *buf, unsigned int x )
-{
-  buf[0] = (x & 1) ? 'W' : '-';
-  buf[1] = (x & 2) ? '1' : '-';
-  buf[2] = (x & 4) ? '2' : '-';
-  buf[3] = (x & 8) ? '3' : '-';
-  return 4;
-}
-
-static void report_state_change(
-  unsigned int this_demand, unsigned int last_demand,
-  unsigned int this_open, unsigned int last_open )
-{
-  char buf[128];
-  char *bp = &buf[0];
-  bp += sprintf(bp, "Change of state; demand ");
-  bp += bits_to_tags(bp, last_demand);
-  bp += sprintf(bp, " -> ");
-  bp += bits_to_tags(bp, this_demand);
-  bp += sprintf(bp, ", open ");
-  bp += bits_to_tags(bp, last_open);
-  bp += sprintf(bp, " -> ");
-  bp += bits_to_tags(bp, this_open);
-  *bp = '\0';
-  Serial.println(buf);
-}
-
-// ----------------------------------------------------------------------------
-
 long overrun_counter_ms = 0;   // counts down
 long underrun_counter_ms = 0;  // counts down
 
@@ -361,107 +410,32 @@ void loop()
 
   pattern( outputs::status_led, 0x0001 & min_brightness );
 
-
-  unsigned int this_demand = 0;
-  unsigned int this_open = 0;
-
-  int index = 0;
+  // update all the state
   for (auto chan : channels)
-  {
     chan->ms_poll();
-    if (chan->has_demand()) this_demand |= (1 << index);
-    if (chan->fully_open()) this_open   |= (1 << index);
-    index++;
-  }
-
-  static unsigned int last_demand = 0;
-  static unsigned int last_open = 0;
-  if (this_demand != last_demand || this_open != last_open)
-    report_state_change( this_demand, last_demand, this_open, last_open );
-
-  if (this_demand == 0 && last_demand != 0)
-  {
-    overrun_ch = &ch1; // safety net - see comment near definition for choice of ch1.
-
-    int index = 0;
-    for (auto chan : channels)
-    {
-      if (last_open & (1 << index))
-        overrun_ch = chan;
-      index++;
-    }
-
-    Serial.print("Overrun valve is ");
-    Serial.println(overrun_ch->tag);
-  }
-
-  last_demand = this_demand;
-  last_open = this_open;
-
-
-  unsigned int any_demanded_is_open = this_demand & this_open;
-
-  if (this_demand != 0)
-  {
-    my_state( State::demand ); // record-keeping
-
-    for (auto chan : channels)
-    {
-      if (chan->has_demand())
-        chan->open();
-      else if (!chan->fully_open())
-        chan->close();  // never got fully open; just close.
-      else if (any_demanded_is_open)
-        chan->close();  // at least one demanded valve is fully open (implictly not this one)
-    }
-
-    boiler.demand( any_demanded_is_open );
-  }
-  else if (!boiler.idle()) // ie overrun
-  {
-    my_state( State::overrun );
-    boiler.demand( false );
-
-    overrun_ch->open();
-      // on the overrun, open this specific channel...
-    if (overrun_ch->fully_open())
-    {
-      // ...then once it's open, close all the others.
-      for (auto chan : channels)
-        if (chan != overrun_ch)
-          chan->close();
-    }
-  }
-  else
-  {
-    my_state( State::idle );
-    boiler.demand( false );
-
-    for (auto chan : channels)
-      chan->close(); // belt and braces
-  }
-
-
+  control.ms_poll();
   boiler.ms_poll();
 
 
 
-
+  // display the results
   for (auto chan : channels)
   {
-    switch (chan->state())
+    auto chanex = static_cast<ChannelEx*>( chan );
+      // can't dynamic_cast because nothing is virtual, but we know a static cast is correct and safe in this instance.
+    switch (chanex->state())
     {
       case Channel::Closed:
-        digitalWrite( chan->led_pin, LOW );
+        digitalWrite( chanex->led_pin, LOW );
         break;
       case Channel::Opening:
-        pattern( chan->led_pin, 0xff00 & mid_brightness );
+        pattern( chanex->led_pin, 0xff00 & mid_brightness );
         break;
       case Channel::Open:
-        digitalWrite( chan->led_pin, HIGH );
+        digitalWrite( chanex->led_pin, HIGH );
         break;
       case Channel::Closing:
-        pattern( chan->led_pin, 0x3333 & mid_brightness );
+        pattern( chanex->led_pin, 0x3333 & mid_brightness );
         break;
       default:
         break;
@@ -484,5 +458,77 @@ void loop()
       break;
     default:
       break;
+  }
+
+  // report the results over serial too
+  char buf[128];
+  auto expand_bits = []( char *buf, unsigned int x ) ->size_t {
+    buf[0] = (x & 1) ? 'w' : '-';
+    for (size_t i = 1; i < num_channels; ++i)
+      buf[i] = (x & (1<<i)) ? (i+'0') : '-';
+    return num_channels;
+  };
+
+  {
+  static unsigned int prev_demand{ 0 };
+  static unsigned int prev_open{ 0 };
+  auto curr_demand = control.demand();
+  auto curr_open = control.open();
+
+  if (curr_demand != prev_demand)
+  {
+    char *bp = &buf[0];
+    bp += sprintf( bp, "Demand: " );
+    bp += expand_bits( bp, prev_demand );
+    bp += sprintf( bp, " --> " );
+    bp += expand_bits( bp, curr_demand );
+    *bp = '\0';
+    Serial.println(buf);
+  }
+  if (curr_open != prev_open)
+  {
+    char *bp = &buf[0];
+    bp += sprintf( bp, "  Open: " );
+    bp += expand_bits( bp, prev_open );
+    bp += sprintf( bp, " --> " );
+    bp += expand_bits( bp, curr_open );
+    *bp = '\0';
+    Serial.println(buf);
+  }
+  prev_demand = curr_demand;
+  prev_open = curr_open;
+  }
+
+  {
+  static auto prev_state = Controller::Idle;
+  auto curr_state = control.state();
+  if (curr_state != prev_state)
+  {
+    switch (curr_state)
+    {
+      case Controller::Idle: Serial.println("  Ctrl: idle"); break;
+      case Controller::Demand: Serial.println("  Ctrl: demanding"); break;
+      case Controller::Cool: Serial.println("  Ctrl: cooling"); break;
+      default: Serial.println("  Ctrl: UKNOWN STATE"); break;
+    }
+  }
+  prev_state = curr_state;
+  }
+
+  {
+  static auto prev_state = Boiler::Idle;
+  auto curr_state = boiler.state();
+  if (curr_state != prev_state)
+  {
+    switch (curr_state)
+    {
+      case Boiler::Idle: Serial.println("Boiler: idle"); break;
+      case Boiler::Underrun: Serial.println("Boiler: underrun"); break;
+      case Boiler::Demand: Serial.println("Boiler: demanding"); break;
+      case Boiler::Overrun: Serial.println("Boiler: overrun"); break;
+      default: Serial.println("Boiler: UNKNOWN STATE"); break;
+    }
+  }
+  prev_state = curr_state;
   }
 }
